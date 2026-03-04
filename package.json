@@ -1,0 +1,15 @@
+{
+  "name": "ai-rate-limit-checker",
+  "version": "1.0.0",
+  "description": "CLI tool to check rate limits across AI coding assistants",
+  "type": "module",
+  "bin": {
+    "ai-limits": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "setup": "node src/index.js --setup"
+  },
+  "keywords": ["cli", "rate-limit", "claude", "codex", "copilot", "gemini", "antigravity"],
+  "license": "MIT"
+}
