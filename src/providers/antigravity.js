@@ -558,9 +558,11 @@ function parseResponse(responseText) {
             const date = new Date(resetTime);
             const seconds = (date - Date.now()) / 1000;
             if (seconds > 0) {
-                const hours = Math.floor(seconds / 3600);
+                const days = Math.floor(seconds / 86400);
+                const hours = Math.floor((seconds % 86400) / 3600);
                 const minutes = Math.floor((seconds % 3600) / 60);
-                if (hours > 0) resetText = `Resets in ${hours}h ${minutes}m`;
+                if (days > 0) resetText = `Resets in ${days}d ${hours}h ${minutes}m`;
+                else if (hours > 0) resetText = `Resets in ${hours}h ${minutes}m`;
                 else if (minutes > 0) resetText = `Resets in ${minutes}m`;
                 else resetText = 'Resets soon';
             }
