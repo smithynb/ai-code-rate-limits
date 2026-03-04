@@ -19,13 +19,28 @@ function formatResetToNextMonthUtc() {
     return 'Resets soon';
 }
 
+/**
+ * Sum premium request usage from the API response.
+ * Handles multiple response shapes:
+ *   - { usageItems: [...] }   (camelCase wrapper)
+ *   - { usage_items: [...] }  (snake_case wrapper)
+ *   - [ ... ]                 (top-level array, no wrapper)
+ */
 function sumPremiumRequests(data) {
-    const usageItems = Array.isArray(data?.usageItems)
-        ? data.usageItems
-        : Array.isArray(data?.usage_items)
-            ? data.usage_items
-            : [];
-    return usageItems.reduce((sum, item) => {
+    let items;
+
+    if (Array.isArray(data)) {
+        // Response is a top-level array of usage items
+        items = data;
+    } else {
+        items = Array.isArray(data?.usageItems)
+            ? data.usageItems
+            : Array.isArray(data?.usage_items)
+                ? data.usage_items
+                : [];
+    }
+
+    const total = items.reduce((sum, item) => {
         const quantity = Number(
             item?.netQuantity ??
             item?.net_quantity ??
@@ -35,6 +50,53 @@ function sumPremiumRequests(data) {
         );
         return Number.isFinite(quantity) ? sum + quantity : sum;
     }, 0);
+
+    if (isDebug) {
+        process.stderr.write(
+            `[Copilot debug] sumPremiumRequests: ${items.length} usage item(s), total = ${total}\n`
+        );
+    }
+
+    return total;
+}
+
+/**
+ * Build common request headers for GitHub API calls.
+ */
+function githubHeaders(token) {
+    return {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': API_VERSION,
+    };
+}
+
+/**
+ * Attempt to fetch premium request usage from a given URL.
+ * Returns { ok, status, data } or throws on network error.
+ */
+async function fetchUsage(url, token) {
+    const res = await fetch(url, {
+        method: 'GET',
+        headers: githubHeaders(token),
+        signal: AbortSignal.timeout(30000),
+    });
+
+    if (isDebug) {
+        const bodyText = await res.clone().text().catch(() => '(unreadable)');
+        process.stderr.write(
+            `\n[Copilot debug] HTTP ${res.status} from ${url}\n` +
+            `[Copilot debug] Response body: ${bodyText}\n`
+        );
+    }
+
+    if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        return { ok: false, status: res.status, errBody };
+    }
+
+    const data = await res.json();
+    return { ok: true, status: res.status, data };
 }
 
 /**
@@ -58,11 +120,7 @@ export async function check(config) {
         // Step 1: Validate token and resolve the token owner login
         const userRes = await fetch(`${API_BASE}/user`, {
             method: 'GET',
-            headers: {
-                Authorization: `Bearer ${githubToken}`,
-                Accept: 'application/vnd.github+json',
-                'X-GitHub-Api-Version': API_VERSION,
-            },
+            headers: githubHeaders(githubToken),
             signal: AbortSignal.timeout(15000),
         });
 
@@ -96,81 +154,101 @@ export async function check(config) {
 
         // Step 2: Fetch premium request usage from official billing endpoint.
         // Docs: GET /users/{username}/settings/billing/premium_request/usage
-        const usagePath = `/users/${encodeURIComponent(resolvedUsername)}/settings/billing/premium_request/usage`;
-        const filteredUsageUrl = `${API_BASE}${usagePath}?product=Copilot`;
-        let usageUrl = filteredUsageUrl;
-        let res = await fetch(usageUrl, {
-            method: 'GET',
-            headers: {
-                Authorization: `Bearer ${githubToken}`,
-                Accept: 'application/vnd.github+json',
-                'X-GitHub-Api-Version': API_VERSION,
-            },
-            signal: AbortSignal.timeout(30000),
-        });
+        // IMPORTANT: Include year + month params to scope to current billing period.
+        // Without these, the API returns ALL usage for the year, not just this month.
+        const now = new Date();
+        const year = now.getUTCFullYear();
+        const month = now.getUTCMonth() + 1; // 1-indexed
 
-        // Backward compatibility if this API variant does not support product filter
-        if (res.status === 422) {
-            usageUrl = `${API_BASE}${usagePath}`;
-            res = await fetch(usageUrl, {
-                method: 'GET',
-                headers: {
-                    Authorization: `Bearer ${githubToken}`,
-                    Accept: 'application/vnd.github+json',
-                    'X-GitHub-Api-Version': API_VERSION,
-                },
-                signal: AbortSignal.timeout(30000),
-            });
-        }
+        const usagePath = `/users/${encodeURIComponent(resolvedUsername)}/settings/billing/premium_request/usage`;
+        const baseParams = `year=${year}&month=${month}`;
 
         if (isDebug) {
-            const bodyText = await res.clone().text().catch(() => '(unreadable)');
             process.stderr.write(
-                `\n[Copilot debug] HTTP ${res.status} from ${usageUrl}\n` +
-                `[Copilot debug] Response body: ${bodyText}\n`
+                `[Copilot debug] Querying for year=${year}, month=${month}, user=${resolvedUsername}\n`
             );
         }
 
-        if (res.status === 401) {
-            return {
-                provider: name,
-                status: 'error',
-                quotas: [],
-                tier: null,
-                error: 'Auth failed — invalid/expired PAT (run --setup)',
-            };
+        // Try with product=Copilot filter first, then without, then fallback to /user/ endpoint
+        const urlsToTry = [
+            `${API_BASE}${usagePath}?product=Copilot&${baseParams}`,
+            `${API_BASE}${usagePath}?${baseParams}`,
+            // Fallback: authenticated user endpoint (no username in path)
+            `${API_BASE}/user/settings/billing/premium_request/usage?product=Copilot&${baseParams}`,
+            `${API_BASE}/user/settings/billing/premium_request/usage?${baseParams}`,
+        ];
+
+        let usageData = null;
+        let lastStatus = null;
+        let lastErrBody = '';
+
+        for (const url of urlsToTry) {
+            const result = await fetchUsage(url, githubToken);
+
+            if (result.ok) {
+                usageData = result.data;
+                break;
+            }
+
+            lastStatus = result.status;
+            lastErrBody = result.errBody || '';
+
+            // Don't retry on auth errors — they won't change
+            if (result.status === 401) {
+                return {
+                    provider: name,
+                    status: 'error',
+                    quotas: [],
+                    tier: null,
+                    error: 'Auth failed — invalid/expired PAT (run --setup)',
+                };
+            }
+
+            if (result.status === 403) {
+                return {
+                    provider: name,
+                    status: 'error',
+                    quotas: [],
+                    tier: null,
+                    error: 'PAT lacks billing permission — use a fine-grained PAT with User "Plan: Read"',
+                };
+            }
+
+            // 422 means this URL variant isn't supported, try next
+            // 404 also try next (might work with /user/ fallback)
+            if (result.status !== 422 && result.status !== 404) {
+                // Unexpected error — stop retrying
+                break;
+            }
         }
 
-        if (res.status === 403) {
-            return {
-                provider: name,
-                status: 'error',
-                quotas: [],
-                tier: null,
-                error: 'PAT lacks billing permission — use a fine-grained PAT with User "Plan: Read"',
-            };
+        if (!usageData) {
+            // All URLs failed
+            if (lastStatus === 404) {
+                return {
+                    provider: name,
+                    status: 'error',
+                    quotas: [],
+                    tier: null,
+                    error: 'No personal Copilot billing data found (may be billed via org/enterprise)',
+                };
+            }
+            throw new Error(
+                `HTTP ${lastStatus}${lastErrBody ? ': ' + lastErrBody.slice(0, 120) : ''}`
+            );
         }
 
-        if (res.status === 404) {
-            return {
-                provider: name,
-                status: 'error',
-                quotas: [],
-                tier: null,
-                error: 'No personal Copilot billing data found (may be billed via org/enterprise)',
-            };
-        }
-
-        if (!res.ok) {
-            const errBody = await res.text().catch(() => '');
-            throw new Error(`HTTP ${res.status}${errBody ? ': ' + errBody.slice(0, 120) : ''}`);
-        }
-
-        const data = await res.json();
-        const used = sumPremiumRequests(data);
+        const used = sumPremiumRequests(usageData);
         const limit = Number(monthlyLimit) > 0 ? Number(monthlyLimit) : 300;
         const remaining = Math.max(0, limit - used);
         const percentRemaining = Math.max(0, Math.min(100, (remaining / limit) * 100));
+
+        if (isDebug) {
+            process.stderr.write(
+                `[Copilot debug] Used: ${used}, Limit: ${limit}, Remaining: ${remaining}, ` +
+                `%Remaining: ${percentRemaining.toFixed(1)}%\n`
+            );
+        }
 
         return {
             provider: name,
