@@ -30,7 +30,6 @@ function sumPremiumRequests(data) {
     let items;
 
     if (Array.isArray(data)) {
-        // Response is a top-level array of usage items
         items = data;
     } else {
         items = Array.isArray(data?.usageItems)
@@ -40,10 +39,12 @@ function sumPremiumRequests(data) {
                 : [];
     }
 
+    // Use grossQuantity (actual usage) NOT netQuantity.
+    // The API models included premium requests (e.g. 300/mo for Pro) as a
+    // "discount" — so netQuantity is 0 until you exceed your allowance,
+    // while grossQuantity reflects actual premium requests consumed.
     const total = items.reduce((sum, item) => {
         const quantity = Number(
-            item?.netQuantity ??
-            item?.net_quantity ??
             item?.grossQuantity ??
             item?.gross_quantity ??
             0
@@ -72,10 +73,10 @@ function githubHeaders(token) {
 }
 
 /**
- * Attempt to fetch premium request usage from a given URL.
- * Returns { ok, status, data } or throws on network error.
+ * Attempt to fetch from a URL with debug logging.
+ * Returns { ok, status, data, errBody }.
  */
-async function fetchUsage(url, token) {
+async function fetchWithDebug(url, token) {
     const res = await fetch(url, {
         method: 'GET',
         headers: githubHeaders(token),
@@ -100,11 +101,48 @@ async function fetchUsage(url, token) {
 }
 
 /**
+ * Build all candidate billing URLs to try, in priority order.
+ * We try multiple endpoint paths because GitHub has evolved the API over time:
+ *   - /users/{user}/settings/billing/premium_request/usage  (current docs, Dec 2025+)
+ *   - /users/{user}/billing/copilot/premium-requests         (older/alternative path)
+ *   - /user/settings/billing/premium_request/usage           (auth-user variant)
+ *   - /user/billing/copilot/premium-requests                 (auth-user older variant)
+ * Each path is tried with and without the product=Copilot filter.
+ */
+function buildUsageUrls(username) {
+    const now = new Date();
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth() + 1;
+    const dateParams = `year=${year}&month=${month}`;
+
+    // Path variants
+    const paths = [
+        // Current documented path
+        `/users/${encodeURIComponent(username)}/settings/billing/premium_request/usage`,
+        // Alternative/older documented path
+        `/users/${encodeURIComponent(username)}/billing/copilot/premium-requests`,
+        // Authenticated-user variants (no username in path)
+        `/user/settings/billing/premium_request/usage`,
+        `/user/billing/copilot/premium-requests`,
+    ];
+
+    const urls = [];
+    for (const path of paths) {
+        // Try with product filter first, then without
+        urls.push(`${API_BASE}${path}?product=Copilot&${dateParams}`);
+        urls.push(`${API_BASE}${path}?${dateParams}`);
+    }
+    return urls;
+}
+
+/**
  * Check GitHub Copilot premium request usage via GitHub Billing API.
  * @param {object} config - Config object with copilot.githubUsername and copilot.githubToken
  */
 export async function check(config) {
-    const { githubUsername, githubToken, monthlyLimit = 300 } = config?.copilot || {};
+    const { githubUsername, monthlyLimit = 300 } = config?.copilot || {};
+    // Trim whitespace/newlines that may sneak in during setup
+    const githubToken = (config?.copilot?.githubToken || '').trim();
 
     if (!githubToken) {
         return {
@@ -114,6 +152,19 @@ export async function check(config) {
             tier: null,
             error: '⚠ Not configured — run with --setup to add GitHub PAT',
         };
+    }
+
+    if (isDebug) {
+        const prefix = githubToken.slice(0, 10);
+        const suffix = githubToken.slice(-4);
+        const tokenType = githubToken.startsWith('github_pat_')
+            ? 'fine-grained'
+            : githubToken.startsWith('ghp_')
+                ? 'classic'
+                : 'unknown-type';
+        process.stderr.write(
+            `[Copilot debug] Token: ${prefix}...${suffix} (${tokenType}, ${githubToken.length} chars)\n`
+        );
     }
 
     try {
@@ -152,38 +203,24 @@ export async function check(config) {
             throw new Error('Could not resolve GitHub username from token');
         }
 
-        // Step 2: Fetch premium request usage from official billing endpoint.
-        // Docs: GET /users/{username}/settings/billing/premium_request/usage
-        // IMPORTANT: Include year + month params to scope to current billing period.
-        // Without these, the API returns ALL usage for the year, not just this month.
+        // Step 2: Fetch premium request usage.
+        // We try multiple endpoint paths + filter combos.
         const now = new Date();
-        const year = now.getUTCFullYear();
-        const month = now.getUTCMonth() + 1; // 1-indexed
-
-        const usagePath = `/users/${encodeURIComponent(resolvedUsername)}/settings/billing/premium_request/usage`;
-        const baseParams = `year=${year}&month=${month}`;
-
         if (isDebug) {
             process.stderr.write(
-                `[Copilot debug] Querying for year=${year}, month=${month}, user=${resolvedUsername}\n`
+                `[Copilot debug] Querying for year=${now.getUTCFullYear()}, ` +
+                `month=${now.getUTCMonth() + 1}, user=${resolvedUsername}\n`
             );
         }
 
-        // Try with product=Copilot filter first, then without, then fallback to /user/ endpoint
-        const urlsToTry = [
-            `${API_BASE}${usagePath}?product=Copilot&${baseParams}`,
-            `${API_BASE}${usagePath}?${baseParams}`,
-            // Fallback: authenticated user endpoint (no username in path)
-            `${API_BASE}/user/settings/billing/premium_request/usage?product=Copilot&${baseParams}`,
-            `${API_BASE}/user/settings/billing/premium_request/usage?${baseParams}`,
-        ];
-
+        const urls = buildUsageUrls(resolvedUsername);
         let usageData = null;
         let lastStatus = null;
         let lastErrBody = '';
+        let got403 = false;
 
-        for (const url of urlsToTry) {
-            const result = await fetchUsage(url, githubToken);
+        for (const url of urls) {
+            const result = await fetchWithDebug(url, githubToken);
 
             if (result.ok) {
                 usageData = result.data;
@@ -193,7 +230,7 @@ export async function check(config) {
             lastStatus = result.status;
             lastErrBody = result.errBody || '';
 
-            // Don't retry on auth errors — they won't change
+            // 401 = bad token, stop immediately
             if (result.status === 401) {
                 return {
                     provider: name,
@@ -204,33 +241,41 @@ export async function check(config) {
                 };
             }
 
+            // Track if we got a 403 (permission denied) from any URL
             if (result.status === 403) {
-                return {
-                    provider: name,
-                    status: 'error',
-                    quotas: [],
-                    tier: null,
-                    error: 'PAT lacks billing permission — use a fine-grained PAT with User "Plan: Read"',
-                };
+                got403 = true;
             }
 
-            // 422 means this URL variant isn't supported, try next
-            // 404 also try next (might work with /user/ fallback)
-            if (result.status !== 422 && result.status !== 404) {
-                // Unexpected error — stop retrying
-                break;
+            // 422 = filter not supported, 404 = path not found — try next URL
+            // 403 = permission denied — also try next URL (different path might work)
+            if (result.status === 422 || result.status === 404 || result.status === 403) {
+                continue;
             }
+
+            // Unexpected error — stop retrying
+            break;
         }
 
         if (!usageData) {
-            // All URLs failed
-            if (lastStatus === 404) {
+            // All URLs failed — provide actionable error messages
+            if (got403) {
                 return {
                     provider: name,
                     status: 'error',
                     quotas: [],
                     tier: null,
-                    error: 'No personal Copilot billing data found (may be billed via org/enterprise)',
+                    error: 'PAT lacks billing permission — use a fine-grained PAT with "Plan: Read"',
+                };
+            }
+            if (lastStatus === 404) {
+                // GitHub returns 404 (not 403) when a classic PAT or a fine-grained
+                // PAT without the Plan permission hits the billing endpoint.
+                return {
+                    provider: name,
+                    status: 'error',
+                    quotas: [],
+                    tier: null,
+                    error: 'Billing API returned 404 — ensure you use a fine-grained PAT with "Plan: Read" permission (classic PATs do NOT work for this endpoint)',
                 };
             }
             throw new Error(
